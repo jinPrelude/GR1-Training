@@ -1,1 +1,10 @@
+
+__pycache__
 *.zip
+*.pth
+*.pt
+
+calvin_debug_dataset/
+calvin_lmdb
+Save
+wandb

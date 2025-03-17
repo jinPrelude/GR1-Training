@@ -11,7 +11,6 @@ from transformers import get_cosine_schedule_with_warmup
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 from torch.profiler import profile, record_function, ProfilerActivity, tensorboard_trace_handler
-from torch.utils.tensorboard import SummaryWriter
 import clip
 from LMDBDataset_jpeg import LMDBDataset as LMDBdst_jpeg
 from LMDBDataset_jpeg import DataPrefetcher as DataPrefetcher_jpeg
@@ -19,6 +18,7 @@ from PreProcess import PreProcess
 import models.vision_transformer as vits
 from models.gr1 import GR1 
 from AccelerateFix import AsyncStep
+import wandb
 
 def masked_loss(pred, target, mask, skip_frame=0, loss_func=F.mse_loss):
     if skip_frame == 0:
@@ -34,7 +34,7 @@ def masked_loss(pred, target, mask, skip_frame=0, loss_func=F.mse_loss):
     loss = (loss*new_mask).sum() / new_mask.sum() / math.prod(data_shape[len(mask_shape):])
     return loss
 
-def train(acc, train_prefetcher, test_prefetcher, preprocessor, model, env, eva, eval_dir, optimizer, scheduler, device, cfg, step, writer):
+def train(acc, train_prefetcher, test_prefetcher, preprocessor, model, env, eva, eval_dir, optimizer, scheduler, device, cfg, step):
     '''
     prof = profile(
         schedule = torch.profiler.schedule(
@@ -99,10 +99,11 @@ def train(acc, train_prefetcher, test_prefetcher, preprocessor, model, env, eva,
             'action_arm': 0,
             'action_gripper': 0,
         }
-        for key in log_loss:
-            log_loss[key] = torch.tensor(0).float().to(device)
-        for key in eval_log_loss:
-            eval_log_loss[key] = torch.tensor(0).float().to(device)
+        if acc.is_main_process:
+            for key in log_loss:
+                log_loss[key] = torch.tensor(0).float().to(device)
+            for key in eval_log_loss:
+                eval_log_loss[key] = torch.tensor(0).float().to(device)
         cum_load_time = 0 
         clock = time()
         batch_idx = 0
@@ -180,13 +181,10 @@ def train(acc, train_prefetcher, test_prefetcher, preprocessor, model, env, eva,
                 acc.print(text)
                 if acc.is_main_process:
                     for key in log_loss:
-                        writer.add_scalar(key+'_loss', log_loss[key], step)
+                        wandb.log({key+'_loss': log_loss[key]}, step=step)
                     for key in eval_log_loss:
-                        writer.add_scalar('eval_'+key+'_loss', eval_log_loss[key], step)
-                    writer.add_scalar("reward", avg_reward, step)
-                    writer.add_scalar("learning rate", scheduler.get_last_lr()[0], step)
-                    writer.add_scalar("FPS", fps, step)
-                    writer.add_scalar("loading time in total time", load_pecnt, step)
+                        wandb.log({'eval_'+key+'_loss': eval_log_loss[key]}, step=step)
+                    wandb.log({"reward": avg_reward, "learning rate": scheduler.get_last_lr()[0], "FPS": fps, "loading time in total time": load_pecnt}, step=step)
                     with open(cfg['save_path']+'step.json', 'w') as json_file:
                         json.dump(step, json_file)
 
@@ -264,7 +262,7 @@ if __name__ == '__main__':
     ) 
     model_clip, _ = clip.load(cfg['clip_backbone'], device=device) 
     model_mae = vits.__dict__['vit_base'](patch_size=16, num_classes=0).to(device)
-    checkpoint = torch.load(cfg['mae_ckpt'])
+    checkpoint = torch.load(cfg['mae_ckpt'], weights_only=True)
     model_mae.load_state_dict(checkpoint['model'], strict=False)
     model = GR1(
         model_clip,
@@ -344,7 +342,9 @@ if __name__ == '__main__':
     else:
         env = None
         eva = None
-    writer = SummaryWriter(cfg['save_path'] + 'logs')
+    if acc.is_main_process:
+        wandb.init(project=cfg['wandb_project'], config=cfg)
+    acc.wait_for_everyone()
 
     # Train
-    train(acc, train_prefetcher, test_prefetcher, preprocessor, model, env, eva, eval_dir, optimizer, scheduler, device, cfg, step, writer)
+    train(acc, train_prefetcher, test_prefetcher, preprocessor, model, env, eva, eval_dir, optimizer, scheduler, device, cfg, step)
